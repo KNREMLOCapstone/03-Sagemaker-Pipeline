@@ -1,46 +1,36 @@
-import json
+import sys
+import subprocess
+from typing import Any, Dict, Optional, Tuple, List
+
 import os
 import subprocess
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List
+import torch
+import timm
+import json
+import tarfile
 import torchvision
 import pytorch_lightning as pl
-import timm
-import torch
-import torch.nn.functional as F
 import torchvision.transforms as T
+import torch.nn.functional as F
 
-from pytorch_lightning import loggers as pl_loggers
-from pytorch_lightning.callbacks import TQDMProgressBar
+from pathlib import Path
+from torchvision.datasets import ImageFolder
 from pytorch_lightning.plugins.environments import LightningEnvironment
 from torch.utils.data import DataLoader, Dataset
-from torchmetrics import Accuracy
-from torchmetrics import F1Score, Precision, Recall, ConfusionMatrix, MaxMetric, MeanMetric
-from torchvision.datasets import ImageFolder
+from torchmetrics.functional import accuracy
+from pytorch_lightning import loggers as pl_loggers
+from datetime import datetime
 from PIL import Image
 import pandas as pd
 import seaborn as sn
 import io
 import matplotlib.pyplot as plt
 
+from pytorch_lightning.callbacks import TQDMProgressBar
 
-sm_output_dir = Path(os.environ.get("SM_OUTPUT_DIR"))
-sm_model_dir = Path(os.environ.get("SM_MODEL_DIR"))
-num_cpus = int(os.environ.get("SM_NUM_CPUS"))
-
-ml_root = Path("/opt/ml")
-
-git_path = ml_root / "sagemaker-intelimage"
-
-dvc_repo_url = os.environ.get("DVC_REPO_URL")
-dvc_branch = os.environ.get("DVC_BRANCH")
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-accuracy = Accuracy(task="multiclass", num_classes=6).to(device)
-precision=Precision(task='multiclass',average='macro',num_classes=6).to(device)
-recall = Recall(task="multiclass", average='macro', num_classes=6).to(device)
-confmat = ConfusionMatrix(task="multiclass", num_classes=6).to(device)
+from torchmetrics import Accuracy
+from torchmetrics import F1Score, Precision, Recall, ConfusionMatrix, MaxMetric, MeanMetric
+accuracy1 = Accuracy(task="multiclass", num_classes=6)
 
 
 def get_training_env():
@@ -48,6 +38,7 @@ def get_training_env():
     sm_training_env = json.loads(sm_training_env)
 
     return sm_training_env
+
 
 class IntHandler:
     def legend_artist(self, legend, orig_handle, fontsize, handlebox):
@@ -327,52 +318,71 @@ class IntelImgClfDataModule(pl.LightningDataModule):
     def load_state_dict(self, state_dict: Dict[str, Any]):
         """Things to do when loading checkpoint."""
         pass
+    
 
 
-def train_and_evaluate(model, datamodule, sm_training_env, output_dir):
-    tb_logger = pl_loggers.TensorBoardLogger(
-        save_dir=ml_root / "output" / "tensorboard" / sm_training_env["job_name"]
-    )
-    trainer = pl.Trainer(
-        max_epochs=5,
-        accelerator="auto",
-        logger=[tb_logger],
-        callbacks=[TQDMProgressBar(refresh_rate=10)],
-    )
 
-    trainer.fit(model, datamodule)
-    trainer.test(model, datamodule)
+ml_root = Path("/opt/ml")
+git_path = ml_root / "sagemaker-intelimage"
 
-    idx_to_class = {k: v for v, k in datamodule.data_train.class_to_idx.items()}
+model_artifacts = ml_root / "processing" / "model"
+dataset_dir = ml_root / "sagemaker-intelimage" / "dataset"
+
+def eval_model(trainer, model, datamodule):
+    test_res = trainer.test(model, datamodule)[0]
+    idx_to_class = {k: v for v,k in datamodule.data_train.class_to_idx.items()}
     model.idx_to_class = idx_to_class
 
-#     # per class accuracy
-#     confusion_matrix = torch.zeros(datamodule.num_classes, datamodule.num_classes).to(device)
-#     with torch.no_grad():
-#         for i, (images, targets) in enumerate(datamodule.test_dataloader()):
-#             images = images.to(device)
-#             targets = targets.to(device)
-#             outputs = model(images)
-#             _, preds = torch.max(outputs, 1)
-#             for t, p in zip(targets.view(-1), preds.view(-1)):
-#                 confusion_matrix[t.long(), p.long()] += 1
+    # calculating per class accuracy
+    nb_classes = datamodule.num_classes
 
-#     acc_per_class = {
-#         idx_to_class[idx]: val.item() * 100
-#         for idx, val in enumerate(confusion_matrix.diag() / confusion_matrix.sum(1))
-#     }
-#     print(acc_per_class)
+    confusion_matrix = torch.zeros(nb_classes, nb_classes)
+    # acc_all = 0
+    with torch.no_grad():
+        for i, (images, targets) in enumerate(datamodule.test_dataloader()):
+            # images = images.to(device)
+            # targets = targets.to(device)
+            outputs = model(images)
+            # acc_all += (outputs == targets).sum()
+            _, preds = torch.max(outputs, 1)
+            for t, p in zip(targets.view(-1), preds.view(-1)):
+                confusion_matrix[t.long(), p.long()] += 1
+    """
+    Simple Logic may be useful:
+    acc = [0 for c in list_of_classes]
+    for c in list_of_classes:
+        acc[c] = ((preds == labels) * (labels == c)).float() / (max(labels == c).sum(), 1))
+    """
+    
+    # acc_all = acc_all / len(datamodule.test_dataloader())
 
-#     with open(output_dir / "accuracy_per_class.json", "w") as outfile:
-#         json.dump(acc_per_class, outfile)
+    accuracy_per_class = {
+        idx_to_class[idx]: val.item() * 100 for idx, val in enumerate(confusion_matrix.diag() / confusion_matrix.sum(1))
+    }
+    print(accuracy_per_class)
+    
+    report_dict = {
+        "multiclass_classification_metrics": {
+            "accuracy": {
+                "value": test_res["test/acc"],
+                "standard_deviation": "0",
+            },
+            "confusion_matrix" : accuracy_per_class,
+        },
+    }
+    
+    eval_folder = ml_root / "processing" / "evaluation"
+    eval_folder.mkdir(parents=True, exist_ok=True)
+    
+    out_path = eval_folder / "evaluation.json"
+    
+    print(f":: Writing to {out_path.absolute()}")
+    
+    with out_path.open("w") as f:
+        f.write(json.dumps(report_dict))
 
-
-def save_scripted_model(model, output_dir):
-    script = model.to_torchscript()
-
-    # save for use in production environment
-    torch.jit.save(script, output_dir / "model.scripted.pt")
-
+dvc_repo_url = "codecommit::ap-south-1://sagemaker-intel-classification"
+dvc_branch = "pipeline-processed-dataset"
 
 def clone_dvc_git_repo():
     print(f":: Configure git to pull authenticated from CodeCommit")
@@ -393,23 +403,22 @@ def dvc_pull():
 if __name__ == "__main__":
     clone_dvc_git_repo()
     dvc_pull()
-
-    img_dset = ImageFolder(git_path / "dataset" / "train")
-
-    print(":: Classnames: ", img_dset.classes)
-
+    
+    model_path = "/opt/ml/processing/model/model.tar.gz"
+    with tarfile.open(model_path) as tar:
+        tar.extractall(path=".")
+    
     datamodule = IntelImgClfDataModule(
-        data_dir=(git_path / "dataset").absolute(), num_workers=num_cpus
+        data_dir=dataset_dir.absolute(),
+        num_workers=os.cpu_count()
     )
     datamodule.setup()
-
-    model = LitResnet(num_classes=datamodule.num_classes)
-    model = model.to(device)
-
-    sm_training_env = get_training_env()
-
-    print(":: Training ...")
-    train_and_evaluate(model, datamodule, sm_training_env, sm_model_dir)
-
-    print(":: Saving Scripted Model")
-    save_scripted_model(model, sm_model_dir)
+    
+    model = LitResnet.load_from_checkpoint(checkpoint_path="last.ckpt")
+    
+    trainer = pl.Trainer(
+        accelerator="auto",
+    )
+    
+    print(":: Evaluating Model")
+    eval_model(trainer, model, datamodule)
